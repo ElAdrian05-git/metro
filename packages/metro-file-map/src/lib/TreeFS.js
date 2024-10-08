@@ -27,7 +27,19 @@ type DirectoryNode = Map<string, MixedNode>;
 type FileNode = FileMetaData;
 type MixedNode = FileNode | DirectoryNode;
 
-type NormalizedSymlinkTarget = {ancestorOfRootIdx: ?number, normalPath: string};
+function isDirectory(node: ?MixedNode): node is DirectoryNode {
+  return node instanceof Map;
+}
+
+function isRegularFile(node: FileNode): boolean {
+  return node[H.SYMLINK] === 0;
+}
+
+type NormalizedSymlinkTarget = {
+  ancestorOfRootIdx: ?number,
+  normalPath: string,
+  startOfBasenameIdx: number,
+};
 
 /**
  * OVERVIEW:
@@ -143,7 +155,7 @@ export default class TreeFS implements MutableFileSystem {
     })) {
       const newMetadata = files.get(canonicalPath);
       if (newMetadata) {
-        if ((newMetadata[H.SYMLINK] === 0) !== (metadata[H.SYMLINK] === 0)) {
+        if (isRegularFile(newMetadata) !== isRegularFile(metadata)) {
           // Types differ, file has changed
           continue;
         }
@@ -201,7 +213,7 @@ export default class TreeFS implements MutableFileSystem {
       };
     }
     const {canonicalPath, node} = result;
-    const type = node instanceof Map ? 'd' : node[H.SYMLINK] === 0 ? 'f' : 'l';
+    const type = isDirectory(node) ? 'd' : isRegularFile(node) ? 'f' : 'l';
     invariant(
       type !== 'l',
       'lookup follows symlinks, so should never return one (%s -> %s)',
@@ -231,7 +243,7 @@ export default class TreeFS implements MutableFileSystem {
     if (fileMetadata == null) {
       return null;
     }
-    const fileType = fileMetadata[H.SYMLINK] === 0 ? 'f' : 'l';
+    const fileType = isRegularFile(fileMetadata) ? 'f' : 'l';
     const modifiedTime = fileMetadata[H.MTIME];
     return {
       fileType,
@@ -276,7 +288,7 @@ export default class TreeFS implements MutableFileSystem {
       node: contextRoot,
       parentNode: contextRootParent,
     } = contextRootResult;
-    if (!(contextRoot instanceof Map)) {
+    if (!isDirectory(contextRoot)) {
       return;
     }
     const contextRootAbsolutePath =
@@ -365,7 +377,15 @@ export default class TreeFS implements MutableFileSystem {
           followLeaf: false,
           makeDirectories: true,
         });
-        if (!(lookup?.node instanceof Map)) {
+        if (!lookup.exists) {
+          // This should only be possible if the input is non-real and
+          // lookup hits a broken symlink.
+          throw new Error(
+            `TreeFS: Unexpected error adding ${normalPath}.\nMissing: ` +
+              lookup.canonicalMissingPath,
+          );
+        }
+        if (!isDirectory(lookup.node)) {
           throw new Error(
             `TreeFS: Could not add directory ${dirname}, adding ${normalPath}. ` +
               `${dirname} already exists in the file map as a file.`,
@@ -386,7 +406,7 @@ export default class TreeFS implements MutableFileSystem {
     }
     const {parentNode, canonicalPath, node} = result;
 
-    if (node instanceof Map && node.size > 0) {
+    if (isDirectory(node) && node.size > 0) {
       throw new Error(
         `TreeFS: remove called on a non-empty directory: ${mixedPath}`,
       );
@@ -402,7 +422,7 @@ export default class TreeFS implements MutableFileSystem {
         this.remove(path.dirname(canonicalPath));
       }
     }
-    return node instanceof Map ? null : node;
+    return isDirectory(node) ? null : node;
   }
 
   /**
@@ -532,12 +552,12 @@ export default class TreeFS implements MutableFileSystem {
       if (
         // ...at a directory node and the only subsequent character is `/`, or
         (nextSepIdx === targetNormalPath.length - 1 &&
-          segmentNode instanceof Map) ||
+          isDirectory(segmentNode)) ||
         // there are no subsequent `/`, and this node is anything but a symlink
         // we're required to resolve due to followLeaf.
         (isLastSegment &&
-          (segmentNode instanceof Map ||
-            segmentNode[H.SYMLINK] === 0 ||
+          (isDirectory(segmentNode) ||
+            isRegularFile(segmentNode) ||
             opts.followLeaf === false))
       ) {
         return {
@@ -552,7 +572,7 @@ export default class TreeFS implements MutableFileSystem {
       }
 
       // If the next node is a directory, go into it
-      if (segmentNode instanceof Map) {
+      if (isDirectory(segmentNode)) {
         parentNode = segmentNode;
         if (collectAncestors && isUnseen) {
           const currentPath = isLastSegment
@@ -570,7 +590,7 @@ export default class TreeFS implements MutableFileSystem {
           ? targetNormalPath
           : targetNormalPath.slice(0, fromIdx - 1);
 
-        if (segmentNode[H.SYMLINK] === 0) {
+        if (isRegularFile(segmentNode)) {
           // Regular file in a directory path
           return {
             canonicalMissingPath: currentPath,
@@ -626,7 +646,7 @@ export default class TreeFS implements MutableFileSystem {
           for (
             let i = 0;
             i <= joinedResult.collapsedSegments &&
-            /* for Flow, always true: */ node instanceof Map;
+            /* for Flow, always true: */ isDirectory(node);
             i++
           ) {
             if (
@@ -651,9 +671,10 @@ export default class TreeFS implements MutableFileSystem {
         }
 
         // For the purpose of collecting ancestors: Ignore the traversal to
-        // the symlink target, and start collecting ancestors only when we
-        // reach the remaining part of the path.
-        unseenPathFromIdx = normalSymlinkTarget.normalPath.length;
+        // the symlink target, and start collecting ancestors only
+        // from the target itself (ie, the basename of the normal target path)
+        // onwards.
+        unseenPathFromIdx = normalSymlinkTarget.startOfBasenameIdx;
 
         if (seen == null) {
           // Optimisation: set this lazily only when we've encountered a symlink
@@ -731,7 +752,7 @@ export default class TreeFS implements MutableFileSystem {
       collectLinkPaths: invalidatedBy,
     });
 
-    if (closestLookup.exists && closestLookup.node instanceof Map) {
+    if (closestLookup.exists && isDirectory(closestLookup.node)) {
       const maybeAbsolutePathMatch = this.#checkCandidateHasSubpath(
         closestLookup.canonicalPath,
         subpath,
@@ -748,7 +769,7 @@ export default class TreeFS implements MutableFileSystem {
     } else {
       if (
         invalidatedBy &&
-        (!closestLookup.exists || !(closestLookup.node instanceof Map))
+        (!closestLookup.exists || !isDirectory(closestLookup.node))
       ) {
         invalidatedBy.add(
           this.#pathUtils.normalToAbsolute(
@@ -780,7 +801,7 @@ export default class TreeFS implements MutableFileSystem {
     if (closestLookup.exists && closestLookup.ancestorOfRootIdx != null) {
       commonRootDepth = closestLookup.ancestorOfRootIdx;
       invariant(
-        closestLookup.node instanceof Map,
+        isDirectory(closestLookup.node),
         'ancestors of the root must be directories',
       );
       commonRoot = closestLookup.node;
@@ -853,7 +874,7 @@ export default class TreeFS implements MutableFileSystem {
     let nextNode: ?MixedNode = commonRoot;
     let depthBelowCommonRoot = 0;
 
-    while (nextNode instanceof Map) {
+    while (isDirectory(nextNode)) {
       const maybeAbsolutePathMatch = this.#checkCandidateHasSubpath(
         candidateNormalPath,
         subpath,
@@ -909,7 +930,7 @@ export default class TreeFS implements MutableFileSystem {
     if (
       lookupResult.exists &&
       // Should be a Map iff subpathType is directory
-      lookupResult.node instanceof Map === (subpathType === 'd')
+      isDirectory(lookupResult.node) === (subpathType === 'd')
     ) {
       return this.#pathUtils.normalToAbsolute(lookupResult.canonicalPath);
     } else if (invalidatedBy) {
@@ -947,15 +968,15 @@ export default class TreeFS implements MutableFileSystem {
     for (const [name, node] of rootNode) {
       if (
         !opts.includeNodeModules &&
-        node instanceof Map &&
+        isDirectory(node) &&
         name === 'node_modules'
       ) {
         continue;
       }
       const prefixedName = prefix === '' ? name : prefix + path.sep + name;
-      if (node instanceof Map) {
+      if (isDirectory(node)) {
         yield* this._metadataIterator(node, opts, prefixedName);
-      } else if (node[H.SYMLINK] === 0 || opts.includeSymlinks) {
+      } else if (isRegularFile(node) || opts.includeSymlinks) {
         yield {canonicalPath: prefixedName, metadata: node, baseName: name};
       }
     }
@@ -1011,8 +1032,8 @@ export default class TreeFS implements MutableFileSystem {
       }
 
       const nodePath = prefixWithSep + name;
-      if (!(node instanceof Map)) {
-        if (node[H.SYMLINK] === 0) {
+      if (!isDirectory(node)) {
+        if (isRegularFile(node)) {
           // regular file
           yield nodePath;
         } else {
@@ -1043,7 +1064,7 @@ export default class TreeFS implements MutableFileSystem {
             continue;
           }
           const target = resolved.node;
-          if (!(target instanceof Map)) {
+          if (!isDirectory(target)) {
             // Symlink points to a file, just yield the path of the symlink.
             yield nodePath;
           } else if (
@@ -1106,6 +1127,7 @@ export default class TreeFS implements MutableFileSystem {
       ancestorOfRootIdx:
         this.#pathUtils.getAncestorOfRootIdx(normalSymlinkTarget),
       normalPath: normalSymlinkTarget,
+      startOfBasenameIdx: normalSymlinkTarget.lastIndexOf(path.sep) + 1,
     };
     this.#cachedNormalSymlinkTargets.set(symlinkNode, result);
     return result;
@@ -1119,7 +1141,7 @@ export default class TreeFS implements MutableFileSystem {
     const result = this._lookupByNormalPath(normalPath, {
       followLeaf: opts.followLeaf,
     });
-    if (!result.exists || result.node instanceof Map) {
+    if (!result.exists || isDirectory(result.node)) {
       return null;
     }
     return result.node;
@@ -1128,7 +1150,7 @@ export default class TreeFS implements MutableFileSystem {
   _cloneTree(root: DirectoryNode): DirectoryNode {
     const clone: DirectoryNode = new Map();
     for (const [name, node] of root) {
-      if (node instanceof Map) {
+      if (isDirectory(node)) {
         clone.set(name, this._cloneTree(node));
       } else {
         clone.set(name, [...node]);
